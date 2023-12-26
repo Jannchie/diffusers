@@ -854,7 +854,6 @@ class TensorRTStableDiffusionImg2ImgPipeline(StableDiffusionImg2ImgPipeline):
         init_latents = runEngine(self.engine["vae_encoder"], {"images": device_view(init_image)}, self.stream)[
             "latent"
         ]
-        init_latents = 0.18215 * init_latents
         return init_latents
 
     def __encode_prompt(self, prompt, negative_prompt):
@@ -940,7 +939,6 @@ class TensorRTStableDiffusionImg2ImgPipeline(StableDiffusionImg2ImgPipeline):
 
             latents = self.scheduler.step(noise_pred, timestep, latents).prev_sample
 
-        latents = 1.0 / 0.18215 * latents
         return latents
 
     def __decode_latent(self, latents):
