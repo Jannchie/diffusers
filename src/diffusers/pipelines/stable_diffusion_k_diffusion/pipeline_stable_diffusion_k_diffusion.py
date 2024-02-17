@@ -1,4 +1,4 @@
-# Copyright 2023 The HuggingFace Team. All rights reserved.
+# Copyright 2024 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -134,7 +134,15 @@ class StableDiffusionKDiffusionPipeline(DiffusionPipeline, TextualInversionLoade
     def set_scheduler(self, scheduler_type: str):
         library = importlib.import_module("k_diffusion")
         sampling = getattr(library, "sampling")
-        self.sampler = getattr(sampling, scheduler_type)
+        try:
+            self.sampler = getattr(sampling, scheduler_type)
+        except Exception:
+            valid_samplers = []
+            for s in dir(sampling):
+                if "sample_" in s:
+                    valid_samplers.append(s)
+
+            raise ValueError(f"Invalid scheduler type {scheduler_type}. Please choose one of {valid_samplers}.")
 
     # Copied from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion.StableDiffusionPipeline._encode_prompt
     def _encode_prompt(
@@ -230,7 +238,7 @@ class StableDiffusionKDiffusionPipeline(DiffusionPipeline, TextualInversionLoade
             batch_size = prompt_embeds.shape[0]
 
         if prompt_embeds is None:
-            # textual inversion: procecss multi-vector tokens if necessary
+            # textual inversion: process multi-vector tokens if necessary
             if isinstance(self, TextualInversionLoaderMixin):
                 prompt = self.maybe_convert_prompt(prompt, self.tokenizer)
 
@@ -312,7 +320,7 @@ class StableDiffusionKDiffusionPipeline(DiffusionPipeline, TextualInversionLoade
             else:
                 uncond_tokens = negative_prompt
 
-            # textual inversion: procecss multi-vector tokens if necessary
+            # textual inversion: process multi-vector tokens if necessary
             if isinstance(self, TextualInversionLoaderMixin):
                 uncond_tokens = self.maybe_convert_prompt(uncond_tokens, self.tokenizer)
 
@@ -378,7 +386,6 @@ class StableDiffusionKDiffusionPipeline(DiffusionPipeline, TextualInversionLoade
         image = image.cpu().permute(0, 2, 3, 1).float().numpy()
         return image
 
-    # Copied from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion.StableDiffusionPipeline.check_inputs
     def check_inputs(
         self,
         prompt,
