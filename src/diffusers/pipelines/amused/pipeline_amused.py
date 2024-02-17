@@ -1,4 +1,4 @@
-# Copyright 2023 The HuggingFace Team. All rights reserved.
+# Copyright 2024 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -31,7 +31,7 @@ EXAMPLE_DOC_STRING = """
         >>> from diffusers import AmusedPipeline
 
         >>> pipe = AmusedPipeline.from_pretrained(
-        ...     "huggingface/amused-512", variant="fp16", torch_dtype=torch.float16
+        ...     "amused/amused-512", variant="fp16", torch_dtype=torch.float16
         ... )
         >>> pipe = pipe.to("cuda")
 
