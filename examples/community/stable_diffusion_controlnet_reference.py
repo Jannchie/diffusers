@@ -469,11 +469,10 @@ class StableDiffusionControlNetReferencePipeline(StableDiffusionControlNetPipeli
         def hacked_mid_forward(self, *args, **kwargs):
             eps = 1e-6
             x = self.original_forward(*args, **kwargs)
-            if MODE == "write":
-                if gn_auto_machine_weight >= self.gn_weight:
-                    var, mean = torch.var_mean(x, dim=(2, 3), keepdim=True, correction=0)
-                    self.mean_bank.append(mean)
-                    self.var_bank.append(var)
+            if MODE == "write" and gn_auto_machine_weight >= self.gn_weight:
+                var, mean = torch.var_mean(x, dim=(2, 3), keepdim=True, correction=0)
+                self.mean_bank.append(mean)
+                self.var_bank.append(var)
             if MODE == "read":
                 if len(self.mean_bank) > 0 and len(self.var_bank) > 0:
                     var, mean = torch.var_mean(x, dim=(2, 3), keepdim=True, correction=0)
