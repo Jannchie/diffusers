@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import copy
 import inspect
 import os
 from pathlib import Path
@@ -21,21 +22,19 @@ import torch
 from huggingface_hub import model_info
 from huggingface_hub.constants import HF_HUB_OFFLINE
 from huggingface_hub.utils import validate_hf_hub_args
-from packaging import version
 from torch import nn
 
-from .. import __version__
-from ..models.modeling_utils import _LOW_CPU_MEM_USAGE_DEFAULT
+from ..models.modeling_utils import load_state_dict
 from ..utils import (
     USE_PEFT_BACKEND,
     _get_model_file,
     convert_state_dict_to_diffusers,
     convert_state_dict_to_peft,
-    convert_unet_state_dict_to_peft,
     delete_adapter_layers,
     get_adapter_name,
     get_peft_kwargs,
     is_accelerate_available,
+    is_peft_version,
     is_transformers_available,
     logging,
     recurse_remove_peft_layers,
@@ -113,17 +112,14 @@ class LoraLoaderMixin:
         # First, ensure that the checkpoint is a compatible one and can be successfully loaded.
         state_dict, network_alphas = self.lora_state_dict(pretrained_model_name_or_path_or_dict, **kwargs)
 
-        is_correct_format = all("lora" in key for key in state_dict.keys())
+        is_correct_format = all("lora" in key or "dora_scale" in key for key in state_dict.keys())
         if not is_correct_format:
             raise ValueError("Invalid LoRA checkpoint.")
-
-        low_cpu_mem_usage = kwargs.pop("low_cpu_mem_usage", _LOW_CPU_MEM_USAGE_DEFAULT)
 
         self.load_lora_into_unet(
             state_dict,
             network_alphas=network_alphas,
             unet=getattr(self, self.unet_name) if not hasattr(self, "unet") else self.unet,
-            low_cpu_mem_usage=low_cpu_mem_usage,
             adapter_name=adapter_name,
             _pipeline=self,
         )
@@ -134,7 +130,6 @@ class LoraLoaderMixin:
             if not hasattr(self, "text_encoder")
             else self.text_encoder,
             lora_scale=self.lora_scale,
-            low_cpu_mem_usage=low_cpu_mem_usage,
             adapter_name=adapter_name,
             _pipeline=self,
         )
@@ -174,9 +169,9 @@ class LoraLoaderMixin:
             force_download (`bool`, *optional*, defaults to `False`):
                 Whether or not to force the (re-)download of the model weights and configuration files, overriding the
                 cached versions if they exist.
-            resume_download (`bool`, *optional*, defaults to `False`):
-                Whether or not to resume downloading the model weights and configuration files. If set to `False`, any
-                incompletely downloaded files are deleted.
+            resume_download:
+                Deprecated and ignored. All downloads are now resumed by default when possible. Will be removed in v1
+                of Diffusers.
             proxies (`Dict[str, str]`, *optional*):
                 A dictionary of proxy servers to use by protocol or endpoint, for example, `{'http': 'foo.bar:3128',
                 'http://hostname': 'foo.bar:4012'}`. The proxies are used on each request.
@@ -191,22 +186,14 @@ class LoraLoaderMixin:
                 allowed by Git.
             subfolder (`str`, *optional*, defaults to `""`):
                 The subfolder location of a model file within a larger model repository on the Hub or locally.
-            low_cpu_mem_usage (`bool`, *optional*, defaults to `True` if torch version >= 1.9.0 else `False`):
-                Speed up model loading only loading the pretrained weights and not initializing the weights. This also
-                tries to not use more than 1x model size in CPU memory (including peak memory) while loading the model.
-                Only supported for PyTorch >= 1.9.0. If you are using an older version of PyTorch, setting this
-                argument to `True` will raise an error.
-            mirror (`str`, *optional*):
-                Mirror source to resolve accessibility issues if you're downloading a model in China. We do not
-                guarantee the timeliness or safety of the source, and you should refer to the mirror site for more
-                information.
-
+            weight_name (`str`, *optional*, defaults to None):
+                Name of the serialized state dict file.
         """
         # Load the main state dict first which has the LoRA layers for either of
         # UNet and text encoder or both.
         cache_dir = kwargs.pop("cache_dir", None)
         force_download = kwargs.pop("force_download", False)
-        resume_download = kwargs.pop("resume_download", False)
+        resume_download = kwargs.pop("resume_download", None)
         proxies = kwargs.pop("proxies", None)
         local_files_only = kwargs.pop("local_files_only", None)
         token = kwargs.pop("token", None)
@@ -281,7 +268,7 @@ class LoraLoaderMixin:
                     subfolder=subfolder,
                     user_agent=user_agent,
                 )
-                state_dict = torch.load(model_file, map_location="cpu")
+                state_dict = load_state_dict(model_file)
         else:
             state_dict = pretrained_model_name_or_path_or_dict
 
@@ -361,13 +348,17 @@ class LoraLoaderMixin:
         is_model_cpu_offload = False
         is_sequential_cpu_offload = False
 
-        if _pipeline is not None:
+        if _pipeline is not None and _pipeline.hf_device_map is None:
             for _, component in _pipeline.components.items():
                 if isinstance(component, nn.Module) and hasattr(component, "_hf_hook"):
                     if not is_model_cpu_offload:
                         is_model_cpu_offload = isinstance(component._hf_hook, CpuOffload)
                     if not is_sequential_cpu_offload:
-                        is_sequential_cpu_offload = isinstance(component._hf_hook, AlignDevicesHook)
+                        is_sequential_cpu_offload = (
+                            isinstance(component._hf_hook, AlignDevicesHook)
+                            or hasattr(component._hf_hook, "hooks")
+                            and isinstance(component._hf_hook.hooks[0], AlignDevicesHook)
+                        )
 
                     logger.info(
                         "Accelerate hooks detected. Since you have called `load_lora_weights()`, the previous hooks will be first removed. Then the LoRA parameters will be loaded and the hooks will be applied again."
@@ -377,9 +368,7 @@ class LoraLoaderMixin:
         return (is_model_cpu_offload, is_sequential_cpu_offload)
 
     @classmethod
-    def load_lora_into_unet(
-        cls, state_dict, network_alphas, unet, low_cpu_mem_usage=None, adapter_name=None, _pipeline=None
-    ):
+    def load_lora_into_unet(cls, state_dict, network_alphas, unet, adapter_name=None, _pipeline=None):
         """
         This will load the LoRA layers specified in `state_dict` into `unet`.
 
@@ -389,14 +378,11 @@ class LoraLoaderMixin:
                 into the unet or prefixed with an additional `unet` which can be used to distinguish between text
                 encoder lora layers.
             network_alphas (`Dict[str, float]`):
-                See `LoRALinearLayer` for more details.
+                The value of the network alpha used for stable learning and preventing underflow. This value has the
+                same meaning as the `--network_alpha` option in the kohya-ss trainer script. Refer to [this
+                link](https://github.com/darkstorm2150/sd-scripts/blob/main/docs/train_network_README-en.md#execute-learning).
             unet (`UNet2DConditionModel`):
                 The UNet model to load the LoRA layers into.
-            low_cpu_mem_usage (`bool`, *optional*, defaults to `True` if torch version >= 1.9.0 else `False`):
-                Speed up model loading only loading the pretrained weights and not initializing the weights. This also
-                tries to not use more than 1x model size in CPU memory (including peak memory) while loading the model.
-                Only supported for PyTorch >= 1.9.0. If you are using an older version of PyTorch, setting this
-                argument to `True` will raise an error.
             adapter_name (`str`, *optional*):
                 Adapter name to be used for referencing the loaded adapter model. If not specified, it will use
                 `default_{i}` where i is the total number of adapters being loaded.
@@ -404,85 +390,18 @@ class LoraLoaderMixin:
         if not USE_PEFT_BACKEND:
             raise ValueError("PEFT backend is required for this method.")
 
-        from peft import LoraConfig, inject_adapter_in_model, set_peft_model_state_dict
-
-        low_cpu_mem_usage = low_cpu_mem_usage if low_cpu_mem_usage is not None else _LOW_CPU_MEM_USAGE_DEFAULT
         # If the serialization format is new (introduced in https://github.com/huggingface/diffusers/pull/2918),
         # then the `state_dict` keys should have `cls.unet_name` and/or `cls.text_encoder_name` as
         # their prefixes.
         keys = list(state_dict.keys())
+        only_text_encoder = all(key.startswith(cls.text_encoder_name) for key in keys)
 
-        if all(key.startswith(cls.unet_name) or key.startswith(cls.text_encoder_name) for key in keys):
+        if any(key.startswith(cls.unet_name) for key in keys) and not only_text_encoder:
             # Load the layers corresponding to UNet.
             logger.info(f"Loading {cls.unet_name}.")
-
-            unet_keys = [k for k in keys if k.startswith(cls.unet_name)]
-            state_dict = {k.replace(f"{cls.unet_name}.", ""): v for k, v in state_dict.items() if k in unet_keys}
-
-            if network_alphas is not None:
-                alpha_keys = [k for k in network_alphas.keys() if k.startswith(cls.unet_name)]
-                network_alphas = {
-                    k.replace(f"{cls.unet_name}.", ""): v for k, v in network_alphas.items() if k in alpha_keys
-                }
-
-        else:
-            # Otherwise, we're dealing with the old format. This means the `state_dict` should only
-            # contain the module names of the `unet` as its keys WITHOUT any prefix.
-            if not USE_PEFT_BACKEND:
-                warn_message = "You have saved the LoRA weights using the old format. To convert the old LoRA weights to the new format, you can first load them in a dictionary and then create a new dictionary like the following: `new_state_dict = {f'unet.{module_name}': params for module_name, params in old_state_dict.items()}`."
-                logger.warning(warn_message)
-
-        if len(state_dict.keys()) > 0:
-            if adapter_name in getattr(unet, "peft_config", {}):
-                raise ValueError(
-                    f"Adapter name {adapter_name} already in use in the Unet - please select a new adapter name."
-                )
-
-            state_dict = convert_unet_state_dict_to_peft(state_dict)
-
-            if network_alphas is not None:
-                # The alphas state dict have the same structure as Unet, thus we convert it to peft format using
-                # `convert_unet_state_dict_to_peft` method.
-                network_alphas = convert_unet_state_dict_to_peft(network_alphas)
-
-            rank = {}
-            for key, val in state_dict.items():
-                if "lora_B" in key:
-                    rank[key] = val.shape[1]
-
-            lora_config_kwargs = get_peft_kwargs(rank, network_alphas, state_dict, is_unet=True)
-            lora_config = LoraConfig(**lora_config_kwargs)
-
-            # adapter_name
-            if adapter_name is None:
-                adapter_name = get_adapter_name(unet)
-
-            # In case the pipeline has been already offloaded to CPU - temporarily remove the hooks
-            # otherwise loading LoRA weights will lead to an error
-            is_model_cpu_offload, is_sequential_cpu_offload = cls._optionally_disable_offloading(_pipeline)
-
-            inject_adapter_in_model(lora_config, unet, adapter_name=adapter_name)
-            incompatible_keys = set_peft_model_state_dict(unet, state_dict, adapter_name)
-
-            if incompatible_keys is not None:
-                # check only for unexpected keys
-                unexpected_keys = getattr(incompatible_keys, "unexpected_keys", None)
-                if unexpected_keys:
-                    logger.warning(
-                        f"Loading adapter weights from state_dict led to unexpected keys not found in the model: "
-                        f" {unexpected_keys}. "
-                    )
-
-            # Offload back.
-            if is_model_cpu_offload:
-                _pipeline.enable_model_cpu_offload()
-            elif is_sequential_cpu_offload:
-                _pipeline.enable_sequential_cpu_offload()
-            # Unsafe code />
-
-        unet.load_attn_procs(
-            state_dict, network_alphas=network_alphas, low_cpu_mem_usage=low_cpu_mem_usage, _pipeline=_pipeline
-        )
+            unet.load_attn_procs(
+                state_dict, network_alphas=network_alphas, adapter_name=adapter_name, _pipeline=_pipeline
+            )
 
     @classmethod
     def load_lora_into_text_encoder(
@@ -492,7 +411,6 @@ class LoraLoaderMixin:
         text_encoder,
         prefix=None,
         lora_scale=1.0,
-        low_cpu_mem_usage=None,
         adapter_name=None,
         _pipeline=None,
     ):
@@ -512,11 +430,6 @@ class LoraLoaderMixin:
             lora_scale (`float`):
                 How much to scale the output of the lora linear layer before it is added with the output of the regular
                 lora layer.
-            low_cpu_mem_usage (`bool`, *optional*, defaults to `True` if torch version >= 1.9.0 else `False`):
-                Speed up model loading only loading the pretrained weights and not initializing the weights. This also
-                tries to not use more than 1x model size in CPU memory (including peak memory) while loading the model.
-                Only supported for PyTorch >= 1.9.0. If you are using an older version of PyTorch, setting this
-                argument to `True` will raise an error.
             adapter_name (`str`, *optional*):
                 Adapter name to be used for referencing the loaded adapter model. If not specified, it will use
                 `default_{i}` where i is the total number of adapters being loaded.
@@ -525,8 +438,6 @@ class LoraLoaderMixin:
             raise ValueError("PEFT backend is required for this method.")
 
         from peft import LoraConfig
-
-        low_cpu_mem_usage = low_cpu_mem_usage if low_cpu_mem_usage is not None else _LOW_CPU_MEM_USAGE_DEFAULT
 
         # If the serialization format is new (introduced in https://github.com/huggingface/diffusers/pull/2918),
         # then the `state_dict` keys should have `self.unet_name` and/or `self.text_encoder_name` as
@@ -572,6 +483,15 @@ class LoraLoaderMixin:
                     }
 
                 lora_config_kwargs = get_peft_kwargs(rank, network_alphas, text_encoder_lora_state_dict, is_unet=False)
+                if "use_dora" in lora_config_kwargs:
+                    if lora_config_kwargs["use_dora"]:
+                        if is_peft_version("<", "0.9.0"):
+                            raise ValueError(
+                                "You need `peft` 0.9.0 at least to use DoRA-enabled LoRAs. Please upgrade your installation of `peft`."
+                            )
+                    else:
+                        if is_peft_version("<", "0.9.0"):
+                            lora_config_kwargs.pop("use_dora")
                 lora_config = LoraConfig(**lora_config_kwargs)
 
                 # adapter_name
@@ -601,9 +521,7 @@ class LoraLoaderMixin:
                 # Unsafe code />
 
     @classmethod
-    def load_lora_into_transformer(
-        cls, state_dict, network_alphas, transformer, low_cpu_mem_usage=None, adapter_name=None, _pipeline=None
-    ):
+    def load_lora_into_transformer(cls, state_dict, network_alphas, transformer, adapter_name=None, _pipeline=None):
         """
         This will load the LoRA layers specified in `state_dict` into `transformer`.
 
@@ -616,18 +534,11 @@ class LoraLoaderMixin:
                 See `LoRALinearLayer` for more details.
             unet (`UNet2DConditionModel`):
                 The UNet model to load the LoRA layers into.
-            low_cpu_mem_usage (`bool`, *optional*, defaults to `True` if torch version >= 1.9.0 else `False`):
-                Speed up model loading only loading the pretrained weights and not initializing the weights. This also
-                tries to not use more than 1x model size in CPU memory (including peak memory) while loading the model.
-                Only supported for PyTorch >= 1.9.0. If you are using an older version of PyTorch, setting this
-                argument to `True` will raise an error.
             adapter_name (`str`, *optional*):
                 Adapter name to be used for referencing the loaded adapter model. If not specified, it will use
                 `default_{i}` where i is the total number of adapters being loaded.
         """
         from peft import LoraConfig, inject_adapter_in_model, set_peft_model_state_dict
-
-        low_cpu_mem_usage = low_cpu_mem_usage if low_cpu_mem_usage is not None else _LOW_CPU_MEM_USAGE_DEFAULT
 
         keys = list(state_dict.keys())
 
@@ -654,6 +565,13 @@ class LoraLoaderMixin:
                     rank[key] = val.shape[1]
 
             lora_config_kwargs = get_peft_kwargs(rank, network_alphas, state_dict)
+            if "use_dora" in lora_config_kwargs:
+                if lora_config_kwargs["use_dora"] and is_peft_version("<", "0.9.0"):
+                    raise ValueError(
+                        "You need `peft` 0.9.0 at least to use DoRA-enabled LoRAs. Please upgrade your installation of `peft`."
+                    )
+                else:
+                    lora_config_kwargs.pop("use_dora")
             lora_config = LoraConfig(**lora_config_kwargs)
 
             # adapter_name
@@ -815,22 +733,11 @@ class LoraLoaderMixin:
         >>> ...
         ```
         """
-        unet = getattr(self, self.unet_name) if not hasattr(self, "unet") else self.unet
-
         if not USE_PEFT_BACKEND:
-            if version.parse(__version__) > version.parse("0.23"):
-                logger.warning(
-                    "You are using `unload_lora_weights` to disable and unload lora weights. If you want to iteratively enable and disable adapter weights,"
-                    "you can use `pipe.enable_lora()` or `pipe.disable_lora()`. After installing the latest version of PEFT."
-                )
+            raise ValueError("PEFT backend is required for this method.")
 
-            for _, module in unet.named_modules():
-                if hasattr(module, "set_lora_layer"):
-                    module.set_lora_layer(None)
-        else:
-            recurse_remove_peft_layers(unet)
-            if hasattr(unet, "peft_config"):
-                del unet.peft_config
+        unet = getattr(self, self.unet_name) if not hasattr(self, "unet") else self.unet
+        unet.unload_lora()
 
         # Safe to call the following regardless of LoRA.
         self._remove_text_encoder_monkey_patch()
@@ -959,7 +866,7 @@ class LoraLoaderMixin:
         self,
         adapter_names: Union[List[str], str],
         text_encoder: Optional["PreTrainedModel"] = None,  # noqa: F821
-        text_encoder_weights: List[float] = None,
+        text_encoder_weights: Optional[Union[float, List[float], List[None]]] = None,
     ):
         """
         Sets the adapter layers for the text encoder.
@@ -977,15 +884,20 @@ class LoraLoaderMixin:
             raise ValueError("PEFT backend is required for this method.")
 
         def process_weights(adapter_names, weights):
-            if weights is None:
-                weights = [1.0] * len(adapter_names)
-            elif isinstance(weights, float):
-                weights = [weights]
+            # Expand weights into a list, one entry per adapter
+            # e.g. for 2 adapters:  7 -> [7,7] ; [3, None] -> [3, None]
+            if not isinstance(weights, list):
+                weights = [weights] * len(adapter_names)
 
             if len(adapter_names) != len(weights):
                 raise ValueError(
                     f"Length of adapter names {len(adapter_names)} is not equal to the length of the weights {len(weights)}"
                 )
+
+            # Set None values to default of 1.0
+            # e.g. [7,7] -> [7,7] ; [3, None] -> [3,1]
+            weights = [w if w is not None else 1.0 for w in weights]
+
             return weights
 
         adapter_names = [adapter_names] if isinstance(adapter_names, str) else adapter_names
@@ -1033,17 +945,77 @@ class LoraLoaderMixin:
     def set_adapters(
         self,
         adapter_names: Union[List[str], str],
-        adapter_weights: Optional[List[float]] = None,
+        adapter_weights: Optional[Union[float, Dict, List[float], List[Dict]]] = None,
     ):
+        adapter_names = [adapter_names] if isinstance(adapter_names, str) else adapter_names
+
+        adapter_weights = copy.deepcopy(adapter_weights)
+
+        # Expand weights into a list, one entry per adapter
+        if not isinstance(adapter_weights, list):
+            adapter_weights = [adapter_weights] * len(adapter_names)
+
+        if len(adapter_names) != len(adapter_weights):
+            raise ValueError(
+                f"Length of adapter names {len(adapter_names)} is not equal to the length of the weights {len(adapter_weights)}"
+            )
+
+        # Decompose weights into weights for unet, text_encoder and text_encoder_2
+        unet_lora_weights, text_encoder_lora_weights, text_encoder_2_lora_weights = [], [], []
+
+        list_adapters = self.get_list_adapters()  # eg {"unet": ["adapter1", "adapter2"], "text_encoder": ["adapter2"]}
+        all_adapters = {
+            adapter for adapters in list_adapters.values() for adapter in adapters
+        }  # eg ["adapter1", "adapter2"]
+        invert_list_adapters = {
+            adapter: [part for part, adapters in list_adapters.items() if adapter in adapters]
+            for adapter in all_adapters
+        }  # eg {"adapter1": ["unet"], "adapter2": ["unet", "text_encoder"]}
+
+        for adapter_name, weights in zip(adapter_names, adapter_weights):
+            if isinstance(weights, dict):
+                unet_lora_weight = weights.pop("unet", None)
+                text_encoder_lora_weight = weights.pop("text_encoder", None)
+                text_encoder_2_lora_weight = weights.pop("text_encoder_2", None)
+
+                if len(weights) > 0:
+                    raise ValueError(
+                        f"Got invalid key '{weights.keys()}' in lora weight dict for adapter {adapter_name}."
+                    )
+
+                if text_encoder_2_lora_weight is not None and not hasattr(self, "text_encoder_2"):
+                    logger.warning(
+                        "Lora weight dict contains text_encoder_2 weights but will be ignored because pipeline does not have text_encoder_2."
+                    )
+
+                # warn if adapter doesn't have parts specified by adapter_weights
+                for part_weight, part_name in zip(
+                    [unet_lora_weight, text_encoder_lora_weight, text_encoder_2_lora_weight],
+                    ["unet", "text_encoder", "text_encoder_2"],
+                ):
+                    if part_weight is not None and part_name not in invert_list_adapters[adapter_name]:
+                        logger.warning(
+                            f"Lora weight dict for adapter '{adapter_name}' contains {part_name}, but this will be ignored because {adapter_name} does not contain weights for {part_name}. Valid parts for {adapter_name} are: {invert_list_adapters[adapter_name]}."
+                        )
+
+            else:
+                unet_lora_weight = weights
+                text_encoder_lora_weight = weights
+                text_encoder_2_lora_weight = weights
+
+            unet_lora_weights.append(unet_lora_weight)
+            text_encoder_lora_weights.append(text_encoder_lora_weight)
+            text_encoder_2_lora_weights.append(text_encoder_2_lora_weight)
+
         unet = getattr(self, self.unet_name) if not hasattr(self, "unet") else self.unet
         # Handle the UNET
-        unet.set_adapters(adapter_names, adapter_weights)
+        unet.set_adapters(adapter_names, unet_lora_weights)
 
         # Handle the Text Encoder
         if hasattr(self, "text_encoder"):
-            self.set_adapters_for_text_encoder(adapter_names, self.text_encoder, adapter_weights)
+            self.set_adapters_for_text_encoder(adapter_names, self.text_encoder, text_encoder_lora_weights)
         if hasattr(self, "text_encoder_2"):
-            self.set_adapters_for_text_encoder(adapter_names, self.text_encoder_2, adapter_weights)
+            self.set_adapters_for_text_encoder(adapter_names, self.text_encoder_2, text_encoder_2_lora_weights)
 
     def disable_lora(self):
         if not USE_PEFT_BACKEND:
@@ -1175,6 +1147,11 @@ class LoraLoaderMixin:
                 for adapter_name in adapter_names:
                     unet_module.lora_A[adapter_name].to(device)
                     unet_module.lora_B[adapter_name].to(device)
+                    # this is a param, not a module, so device placement is not in-place -> re-assign
+                    if hasattr(unet_module, "lora_magnitude_vector") and unet_module.lora_magnitude_vector is not None:
+                        unet_module.lora_magnitude_vector[adapter_name] = unet_module.lora_magnitude_vector[
+                            adapter_name
+                        ].to(device)
 
         # Handle the text encoder
         modules_to_process = []
@@ -1191,6 +1168,14 @@ class LoraLoaderMixin:
                     for adapter_name in adapter_names:
                         text_encoder_module.lora_A[adapter_name].to(device)
                         text_encoder_module.lora_B[adapter_name].to(device)
+                        # this is a param, not a module, so device placement is not in-place -> re-assign
+                        if (
+                            hasattr(text_encoder_module, "lora_magnitude_vector")
+                            and text_encoder_module.lora_magnitude_vector is not None
+                        ):
+                            text_encoder_module.lora_magnitude_vector[
+                                adapter_name
+                            ] = text_encoder_module.lora_magnitude_vector[adapter_name].to(device)
 
 
 class StableDiffusionXLLoraLoaderMixin(LoraLoaderMixin):
@@ -1243,7 +1228,7 @@ class StableDiffusionXLLoraLoaderMixin(LoraLoaderMixin):
             unet_config=self.unet.config,
             **kwargs,
         )
-        is_correct_format = all("lora" in key for key in state_dict.keys())
+        is_correct_format = all("lora" in key or "dora_scale" in key for key in state_dict.keys())
         if not is_correct_format:
             raise ValueError("Invalid LoRA checkpoint.")
 
@@ -1297,6 +1282,9 @@ class StableDiffusionXLLoraLoaderMixin(LoraLoaderMixin):
             text_encoder_lora_layers (`Dict[str, torch.nn.Module]` or `Dict[str, torch.Tensor]`):
                 State dict of the LoRA layers corresponding to the `text_encoder`. Must explicitly pass the text
                 encoder LoRA state dict because it comes from 🤗 Transformers.
+            text_encoder_2_lora_layers (`Dict[str, torch.nn.Module]` or `Dict[str, torch.Tensor]`):
+                State dict of the LoRA layers corresponding to the `text_encoder_2`. Must explicitly pass the text
+                encoder LoRA state dict because it comes from 🤗 Transformers.
             is_main_process (`bool`, *optional*, defaults to `True`):
                 Whether the process calling this is the main process or not. Useful during distributed training and you
                 need to call this function on all processes. In this case, set `is_main_process=True` only on the main
@@ -1323,8 +1311,10 @@ class StableDiffusionXLLoraLoaderMixin(LoraLoaderMixin):
         if unet_lora_layers:
             state_dict.update(pack_weights(unet_lora_layers, "unet"))
 
-        if text_encoder_lora_layers and text_encoder_2_lora_layers:
+        if text_encoder_lora_layers:
             state_dict.update(pack_weights(text_encoder_lora_layers, "text_encoder"))
+
+        if text_encoder_2_lora_layers:
             state_dict.update(pack_weights(text_encoder_2_lora_layers, "text_encoder_2"))
 
         cls.write_lora_layers(
